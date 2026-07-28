@@ -1,40 +1,18 @@
 use std::{
     collections::VecDeque,
     fmt::Debug,
-    future::{Ready, poll_fn},
-    os::fd::{AsFd, BorrowedFd, OwnedFd},
-    sync::{
-        Arc,
-        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
-    },
+    os::fd::{AsFd, OwnedFd},
+    sync::Arc,
     task::{Context, Poll, Wake, Waker},
     thread,
 };
 
 use async_io::Async;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, protocol::wl_registry};
-// This struct represents the state of our app. This simple app does not
-// need any state, but this type still supports the `Dispatch` implementations.
-struct AppData {
-    sender: SyncSender<Event>,
-    receiver: Arc<Receiver<Event>>,
-}
 
 #[derive(Debug)]
 enum Event {
     Registry(String),
-}
-
-const SYNC_SIZE: usize = 100;
-
-impl AppData {
-    pub fn new() -> Self {
-        let (sender, receiver) = sync_channel(SYNC_SIZE);
-        Self {
-            sender,
-            receiver: Arc::new(receiver),
-        }
-    }
 }
 
 // Implement `Dispatch<WlRegistry, ()> for our state. This provides the logic
@@ -47,14 +25,14 @@ impl AppData {
 //
 // In this example, we just use () as we don't have any value to associate. See
 // the `Dispatch` documentation for more details about this.
-impl Dispatch<wl_registry::WlRegistry, ()> for TEMP {
+impl Dispatch<wl_registry::WlRegistry, ()> for Events {
     fn event(
         state: &mut Self,
         _: &wl_registry::WlRegistry,
         event: wl_registry::Event,
         _: &(),
         _: &Connection,
-        _: &QueueHandle<TEMP>,
+        _: &QueueHandle<Events>,
     ) {
         // When receiving events from the wl_registry, we are only interested in the
         // `global` event, which signals a new available global.
@@ -69,43 +47,47 @@ impl Dispatch<wl_registry::WlRegistry, ()> for TEMP {
                 "INNER - [{}] {} (v{})",
                 name, interface, version
             )));
-            println!("yess");
         }
     }
 }
 
 #[derive(Debug)]
-struct TEMP {
+struct Events {
     queue: VecDeque<Event>,
 }
 
-impl TEMP {
+impl Events {
     pub fn new() -> Self {
-        TEMP {
+        Self {
             queue: VecDeque::new(),
         }
     }
+
+    pub fn push(&mut self, event: Event) {
+        self.queue.push_back(event);
+    }
+    pub fn pop(&mut self) -> Option<Event> {
+        self.queue.pop_front()
+    }
 }
 
-impl TEMP {}
-
 #[derive(Debug)]
-struct Data {
+struct App {
     conn: Connection,
-    queue: EventQueue<TEMP>,
-    temp: TEMP,
+    queue: EventQueue<Events>,
+    events: Events,
     fd: Async<OwnedFd>,
 }
 
-impl Data {
-    pub fn new(conn: Connection, queue: EventQueue<TEMP>) -> Self {
+impl App {
+    pub fn new(conn: Connection, queue: EventQueue<Events>) -> Self {
         let fd = conn.as_fd().try_clone_to_owned().unwrap();
         let fd = Async::new(fd).unwrap();
 
         Self {
             conn,
             queue,
-            temp: TEMP::new(),
+            events: Events::new(),
             fd,
         }
     }
@@ -117,7 +99,7 @@ impl Data {
     }
 }
 
-impl Future for Data {
+impl Future for App {
     type Output = Event;
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -126,7 +108,7 @@ impl Future for Data {
         let Self {
             conn,
             queue,
-            temp,
+            events,
             fd,
         } = self.get_mut();
         loop {
@@ -134,9 +116,9 @@ impl Future for Data {
                 let _ = queue.prepare_read().unwrap().read();
             }
 
-            let _ = queue.poll_dispatch_pending(cx, temp);
+            let _ = queue.poll_dispatch_pending(cx, events);
 
-            if let Some(ev) = temp.queue.pop_back() {
+            if let Some(ev) = events.queue.pop_back() {
                 return Poll::Ready(ev);
             }
 
@@ -152,7 +134,7 @@ fn main() {
     let conn = Connection::connect_to_env().unwrap();
     let event_queue = conn.new_event_queue();
 
-    let mut data = Data::new(conn, event_queue);
+    let mut data = App::new(conn, event_queue);
 
     data.registry();
     let a = block_on(data);
@@ -207,113 +189,3 @@ where
         }
     }
 }
-
-// use std::{
-//     io,
-//     sync::{Arc, mpsc::channel},
-//     task::{Context, Poll, Wake, Waker},
-//     thread,
-// };
-//
-// use wayland_client::{
-//     Connection, Dispatch, QueueHandle,
-//     protocol::{wl_display::WlDisplay, wl_registry},
-// };
-// // This struct represents the state of our app. This simple app does not
-// // need any state, but this type still supports the `Dispatch` implementations.
-// struct AppData;
-//
-//
-// // Implement `Dispatch<WlRegistry, ()> for our state. This provides the logic
-// // to be able to process events for the wl_registry interface.
-// //
-// // The second type parameter is the user-data of our implementation. It is a
-// // mechanism that allows you to associate a value to each particular Wayland
-// // object, and allow different dispatching logic depending on the type of the
-// // associated value.
-// //
-// // In this example, we just use () as we don't have any value to associate. See
-// // the `Dispatch` documentation for more details about this.
-// impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
-//     fn event(
-//         _state: &mut Self,
-//         _: &wl_registry::WlRegistry,
-//         event: wl_registry::Event,
-//         _: &(),
-//         _: &Connection,
-//         _: &QueueHandle<AppData>,
-//     ) {
-//         // When receiving events from the wl_registry, we are only interested in the
-//         // `global` event, which signals a new available global.
-//         // When receiving this event, we just print its characteristics in this example.
-//         if let wl_registry::Event::Global {
-//             name,
-//             interface,
-//             version,
-//         } = event
-//         {
-//             println!("[{}] {} (v{})", name, interface, version);
-//         }
-//     }
-// }
-//
-// #[derive(Debug)]
-// enum Event {
-//     One,
-// }
-//
-// struct Wayland;
-//
-// impl Future for Wayland {
-//     type Output = Event;
-//     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-//         Poll::Pending
-//     }
-// }
-//
-// // The main function of our program
-// fn main() {
-//     let (s, r) = channel();
-//
-//     s.send(3);
-//     s.
-//     // Create a Wayland connection by connecting to the server through the
-//     // environment-provided configuration.
-//     let conn = Connection::connect_to_env().unwrap();
-//
-//     // Retrieve the WlDisplay Wayland object from the connection. This object is
-//     // the starting point of any Wayland program, from which all other objects will
-//     // be created.
-//     let display = conn.display();
-//
-//     // Create an event queue for our event processing
-//     let mut event_queue = conn.new_event_queue();
-//     // And get its handle to associate new objects to it
-//     let qh = event_queue.handle();
-//
-//     println!("{:?}", block_on(Wayland));
-//
-//     // Create a wl_registry object by sending the wl_display.get_registry request.
-//     // This method takes two arguments: a handle to the queue that the newly created
-//     // wl_registry will be assigned to, and the user-data that should be associated
-//     // with this registry (here it is () as we don't need user-data).
-//     let _registry = display.get_registry(&qh, ());
-//
-//     // At this point everything is ready, and we just need to wait to receive the events
-//     // from the wl_registry. Our callback will print the advertised globals.
-//     println!("Advertised globals:");
-//
-//     // To actually receive the events, we invoke the `roundtrip` method. This method
-//     // is special and you will generally only invoke it during the setup of your program:
-//     // it will block until the server has received and processed all the messages you've
-//     // sent up to now.
-//     //
-//     // In our case, that means it'll block until the server has received our
-//     // wl_display.get_registry request, and as a reaction has sent us a batch of
-//     // wl_registry.global events.
-//     //
-//     // `roundtrip` will then empty the internal buffer of the queue it has been invoked
-//     // on, and thus invoke our `Dispatch` implementation that prints the list of advertised
-//     // globals.
-//     event_queue.roundtrip(&mut AppData).unwrap();
-// }
