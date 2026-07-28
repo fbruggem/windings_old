@@ -1,12 +1,17 @@
 use std::{
-    future::poll_fn,
-    os::fd::{AsFd, AsRawFd},
+    collections::VecDeque,
+    fmt::Debug,
+    future::{Ready, poll_fn},
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
     sync::{
         Arc,
-        mpsc::{Receiver, SyncSender, sync_channel},
+        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
+    task::{Context, Poll, Wake, Waker},
+    thread,
 };
 
+use async_io::Async;
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, protocol::wl_registry};
 // This struct represents the state of our app. This simple app does not
 // need any state, but this type still supports the `Dispatch` implementations.
@@ -15,8 +20,9 @@ struct AppData {
     receiver: Arc<Receiver<Event>>,
 }
 
+#[derive(Debug)]
 enum Event {
-    Hehe,
+    Registry(String),
 }
 
 const SYNC_SIZE: usize = 100;
@@ -59,29 +65,55 @@ impl Dispatch<wl_registry::WlRegistry, ()> for TEMP {
             version,
         } = event
         {
-            println!("INNER - [{}] {} (v{})", name, interface, version);
+            state.queue.push_back(Event::Registry(format!(
+                "INNER - [{}] {} (v{})",
+                name, interface, version
+            )));
+            println!("yess");
         }
     }
 }
 
-struct TEMP;
+#[derive(Debug)]
+struct TEMP {
+    queue: VecDeque<Event>,
+}
 
+impl TEMP {
+    pub fn new() -> Self {
+        TEMP {
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+impl TEMP {}
+
+#[derive(Debug)]
 struct Data {
     conn: Connection,
     queue: EventQueue<TEMP>,
+    temp: TEMP,
+    fd: Async<OwnedFd>,
 }
 
 impl Data {
     pub fn new(conn: Connection, queue: EventQueue<TEMP>) -> Self {
-        Self { conn, queue }
+        let fd = conn.as_fd().try_clone_to_owned().unwrap();
+        let fd = Async::new(fd).unwrap();
+
+        Self {
+            conn,
+            queue,
+            temp: TEMP::new(),
+            fd,
+        }
     }
 
     pub fn registry(&mut self) {
         let display = self.conn.display();
         let _registry = display.get_registry(&self.queue.handle(), ());
-    }
-    pub fn rount_trip(&mut self) {
-        self.queue.roundtrip(&mut TEMP).unwrap();
+        let _ = self.queue.flush();
     }
 }
 
@@ -91,10 +123,27 @@ impl Future for Data {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let fd = async_io::Async::new(self.conn.as_fd()).unwrap();
-        // fd.poll_readable(cx).
+        let Self {
+            conn,
+            queue,
+            temp,
+            fd,
+        } = self.get_mut();
+        loop {
+            while let Poll::Ready(_) = fd.poll_readable(cx) {
+                let _ = queue.prepare_read().unwrap().read();
+            }
 
-        unimplemented!();
+            let _ = queue.poll_dispatch_pending(cx, temp);
+
+            if let Some(ev) = temp.queue.pop_back() {
+                return Poll::Ready(ev);
+            }
+
+            if let Poll::Pending = fd.poll_readable(cx) {
+                return Poll::Pending;
+            }
+        }
     }
 }
 
@@ -106,7 +155,8 @@ fn main() {
     let mut data = Data::new(conn, event_queue);
 
     data.registry();
-    data.rount_trip();
+    let a = block_on(data);
+
     // To actually receive the events, we invoke the `roundtrip` method. This method
     // is special and you will generally only invoke it during the setup of your program:
     // it will block until the server has received and processed all the messages you've
@@ -126,6 +176,37 @@ fn main() {
 
     // poll_fn(|cx| receiver.try_recv)
 }
+struct ThreadWaker(thread::Thread);
+
+impl ThreadWaker {
+    fn new(thread: thread::Thread) -> Self {
+        Self(thread)
+    }
+}
+
+impl Wake for ThreadWaker {
+    fn wake(self: std::sync::Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: Future>(f: F) -> F::Output
+where
+    F::Output: Debug,
+{
+    let mut f = Box::pin(f);
+    let waker = Waker::from(Arc::new(ThreadWaker::new(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+
+    loop {
+        match f.as_mut().poll(&mut cx) {
+            Poll::Pending => thread::park(),
+            Poll::Ready(v) => {
+                println!("{:?}", v)
+            }
+        }
+    }
+}
 
 // use std::{
 //     io,
@@ -142,32 +223,6 @@ fn main() {
 // // need any state, but this type still supports the `Dispatch` implementations.
 // struct AppData;
 //
-// struct ThreadWaker(thread::Thread);
-//
-// impl ThreadWaker {
-//     fn new(thread: thread::Thread) -> Self {
-//         Self(thread)
-//     }
-// }
-//
-// impl Wake for ThreadWaker {
-//     fn wake(self: std::sync::Arc<Self>) {
-//         self.0.unpark();
-//     }
-// }
-//
-// fn block_on<F: Future>(f: F) -> F::Output {
-//     let mut f = Box::pin(f);
-//     let waker = Waker::from(Arc::new(ThreadWaker::new(thread::current())));
-//     let mut cx = Context::from_waker(&waker);
-//
-//     loop {
-//         match f.as_mut().poll(&mut cx) {
-//             Poll::Pending => thread::park(),
-//             Poll::Ready(v) => return v,
-//         }
-//     }
-// }
 //
 // // Implement `Dispatch<WlRegistry, ()> for our state. This provides the logic
 // // to be able to process events for the wl_registry interface.
