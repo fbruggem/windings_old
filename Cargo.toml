@@ -7,3 +7,4 @@ edition = "2024"
 async-channel = "2.5.0"
 async-io = "2.6.0"
 wayland-client = "0.31.15"
+tokio = { version = "1", features = ["full"] }

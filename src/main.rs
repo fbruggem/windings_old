@@ -1,7 +1,9 @@
 use std::{
     collections::VecDeque,
     fmt::Debug,
+    future::poll_fn,
     os::fd::{AsFd, OwnedFd},
+    pin::{Pin, pin},
     sync::Arc,
     task::{Context, Poll, Wake, Waker},
     thread,
@@ -12,19 +14,13 @@ use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, protocol::wl
 
 #[derive(Debug)]
 enum Event {
-    Registry(String),
+    Registry {
+        name: u32,
+        interface: String,
+        version: u32,
+    },
 }
 
-// Implement `Dispatch<WlRegistry, ()> for our state. This provides the logic
-// to be able to process events for the wl_registry interface.
-//
-// The second type parameter is the user-data of our implementation. It is a
-// mechanism that allows you to associate a value to each particular Wayland
-// object, and allow different dispatching logic depending on the type of the
-// associated value.
-//
-// In this example, we just use () as we don't have any value to associate. See
-// the `Dispatch` documentation for more details about this.
 impl Dispatch<wl_registry::WlRegistry, ()> for Events {
     fn event(
         state: &mut Self,
@@ -34,19 +30,17 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Events {
         _: &Connection,
         _: &QueueHandle<Events>,
     ) {
-        // When receiving events from the wl_registry, we are only interested in the
-        // `global` event, which signals a new available global.
-        // When receiving this event, we just print its characteristics in this example.
         if let wl_registry::Event::Global {
             name,
             interface,
             version,
         } = event
         {
-            state.queue.push_back(Event::Registry(format!(
-                "INNER - [{}] {} (v{})",
-                name, interface, version
-            )));
+            state.queue.push_back(Event::Registry {
+                name,
+                interface,
+                version,
+            });
         }
     }
 }
@@ -61,13 +55,6 @@ impl Events {
         Self {
             queue: VecDeque::new(),
         }
-    }
-
-    pub fn push(&mut self, event: Event) {
-        self.queue.push_back(event);
-    }
-    pub fn pop(&mut self) -> Option<Event> {
-        self.queue.pop_front()
     }
 }
 
@@ -97,6 +84,10 @@ impl App {
         let _registry = display.get_registry(&self.queue.handle(), ());
         let _ = self.queue.flush();
     }
+
+    pub async fn next(&mut self) -> Event {
+        self.await
+    }
 }
 
 impl Future for App {
@@ -116,6 +107,8 @@ impl Future for App {
                 let _ = queue.prepare_read().unwrap().read();
             }
 
+            let _ = queue.flush();
+
             let _ = queue.poll_dispatch_pending(cx, events);
 
             if let Some(ev) = events.queue.pop_back() {
@@ -130,14 +123,18 @@ impl Future for App {
 }
 
 // The main function of our program
-fn main() {
+#[tokio::main]
+async fn main() {
     let conn = Connection::connect_to_env().unwrap();
     let event_queue = conn.new_event_queue();
 
     let mut data = App::new(conn, event_queue);
 
     data.registry();
-    let a = block_on(data);
+
+    loop {
+        println!("{:?}", data.next().await);
+    }
 
     // To actually receive the events, we invoke the `roundtrip` method. This method
     // is special and you will generally only invoke it during the setup of your program:
